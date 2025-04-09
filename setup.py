@@ -11,7 +11,9 @@ nvcc_args = [
     "-U__CUDA_NO_HALF_CONVERSIONS__",
     '--use_fast_math',
     "-Xptxas=-v",
-    "-O3"
+    "-O3",
+    # lineinfo
+    "-lineinfo"
     # "-G"
 ]
 
@@ -23,7 +25,7 @@ setup(
     ext_modules=[
         CUDAExtension(
             name='gemm_ext',
-            sources=['src/gemm_wrapper.cpp', 'src/kernel1.cu'],
+            sources=['src/gemm_wrapper.cpp', 'src/kernel2.cu'],
             extra_compile_args={
                 # 'cxx': ["-g", "-O3", "-fopenmp", "-lgomp", "-std=c++17", "-DENABLE_BF16"],
                 'nvcc': nvcc_args

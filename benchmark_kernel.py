@@ -11,14 +11,14 @@ def benchmark_kernel(M, N, K, n_iters=20):
     
     # warmup
     for i in range(5):
-        _ = torch.ops.gemm_ext.gemm_caller(A, B, 1, 1.0, 0.0)
+        _ = torch.ops.gemm_ext.gemm_caller(A, B, 2, 1.0, 0.0)
     
     # benchmark
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
     start_event.record()
     for i in range(n_iters):
-        _ = torch.ops.gemm_ext.gemm_caller(A, B, 1, 1.0, 0.0)
+        _ = torch.ops.gemm_ext.gemm_caller(A, B, 2, 1.0, 0.0)
     end_event.record()
     torch.cuda.synchronize()
     elapsed_ms = start_event.elapsed_time(end_event)

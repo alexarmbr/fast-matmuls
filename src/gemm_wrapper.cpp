@@ -10,7 +10,17 @@
 using bf16 = __nv_bfloat16;
 
 // Forward declaration of CUDA functions
-void kernel1_launch(
+// void kernel1_launch(
+//     void* A_device,
+//     void* B_device,
+//     void* C_device,
+//     float alpha,
+//     float beta,
+//     unsigned int M,
+//     unsigned int N,
+//     unsigned int K);
+
+void kernel2_launch(
     void* A_device,
     void* B_device,
     void* C_device,
@@ -62,7 +72,12 @@ torch::Tensor gemm_caller(
     TORCH_CHECK(B.stride(0) == 1, "B must be contiguous in the first dimension");
     
     if (kernel_id == 1) {
-        kernel1_launch(A.data_ptr(), B.data_ptr(), C.data_ptr(), static_cast<float>(alpha), static_cast<float>(beta), M, N, K);
+        // kernel1_launch(A.data_ptr(), B.data_ptr(), C.data_ptr(), static_cast<float>(alpha), static_cast<float>(beta), M, N, K);
+        // throw error
+        TORCH_CHECK(false, "Kernel 1 is not implemented");
+    }
+    else if (kernel_id == 2) {
+        kernel2_launch(A.data_ptr(), B.data_ptr(), C.data_ptr(), static_cast<float>(alpha), static_cast<float>(beta), M, N, K);
     }
     else {
         TORCH_CHECK(false, "Invalid kernel ID");
