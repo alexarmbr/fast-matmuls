@@ -25,10 +25,15 @@ np.set_printoptions(threshold=np.inf, linewidth=np.inf)
 # print(C[0, :])
 # print("--------------------------------")
 
-M, N, K = 1024, 1024, 1024
+M, N, K = 2048, 2048, 2048
 A = torch.randn(M, K, dtype=torch.bfloat16, device='cuda')
 B = torch.randn(K, N, dtype=torch.bfloat16, device='cuda')
 B = B.t().contiguous().t()
-C = torch.ops.gemm_ext.gemm_caller(A, B, 2, 1.0, 0.0)
+
+C = torch.ops.gemm_ext.gemm_caller(A, B, 3)
+C_gt = A @ B
+assert torch.allclose(C, C_gt)
+
+C = torch.ops.gemm_ext.gemm_caller(A, B, 2)
 C_gt = A @ B
 assert torch.allclose(C, C_gt)

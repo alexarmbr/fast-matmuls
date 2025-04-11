@@ -5,6 +5,8 @@
 #include <cuda_bf16.h>
 #include <iostream>
 
+namespace kernel1 {
+
 using bf16 = __nv_bfloat16;
 
 #define CUDA_CHECK(status)                                              \
@@ -34,16 +36,6 @@ __device__ __forceinline__ uint32_t cvta_to_shared_u32(const void *pointer) {
     return address;
   }
 
-// https://docs.nvidia.com/cuda/parallel-thread-execution/#asynchronous-warpgroup-level-matrix-shared-memory-layout-matrix-descriptor
-// template <unsigned int smem_width_bytes>
-// __device__ uint64_t make_smem_descriptor(bf16* smem_ptr)
-// {
-//   uint64_t smem_desc = 0;
-//   smem_desc |= matrix_descriptor_encode(cvta_to_shared_u32(smem_ptr));
-//   smem_desc |= matrix_descriptor_encode(smem_width_bytes * 8) << 32; // offset in bytes between groups of 8 rows
-//   smem_desc |= uint64_t(1) << 62; // 128B swizzle
-//   return smem_desc;
-// }
 
 __device__ void warpgroup_arrive() {
     asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
@@ -58,6 +50,7 @@ __device__ void wgmma_wait_group() {
   asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
 }
 
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#asynchronous-warpgroup-level-matrix-shared-memory-layout-matrix-descriptor
 __device__ uint64_t make_smem_desc(bf16* ptr) {
   constexpr uint64_t leading_dim_byte_offset = 16;
   constexpr uint64_t stride_dim_byte_offset = 1024;
@@ -154,28 +147,16 @@ void createTensorMap(bf16* tensor_ptr, unsigned int gmem_height, unsigned int gm
 
 template <unsigned int BM_dim,
 unsigned int BN_dim,
-unsigned int BK_dim,
-unsigned int DBG=0>
+unsigned int BK_dim>
 __global__ void
-kernel_1(
+matmul_kernel(
   const CUtensorMap* tensorMapA,
   const CUtensorMap* tensorMapB,
-  // const __grid_constant__ CUtensorMap tensorMapA,
-  // const __grid_constant__ CUtensorMap tensorMapB,
   bf16* C,
-  const float alpha,
-  const float beta, 
   const unsigned int M,
   const unsigned int N,
   unsigned int K)
 {
-  // if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0){
-  //   printf("M: %d, N: %d, K: %d\n", M, N, K);
-  //   printf("BM_dim: %d, BN_dim: %d, BK_dim: %d\n", BM_dim, BN_dim, BK_dim);
-  //   printf("blockDim.x: %d, blockDim.y: %d\n", blockDim.x, blockDim.y);
-  //   printf("gridDim.x: %d, gridDim.y: %d\n", gridDim.x, gridDim.y);
-  // }
-
   constexpr unsigned int WGMMA_M = 64;
   constexpr unsigned int WGMMA_N = 256;
   constexpr unsigned int WGMMA_K = 16;
@@ -213,15 +194,6 @@ kernel_1(
   __syncthreads();
   float D_reg[128];
   memset(D_reg, 0, sizeof(D_reg));
-  
-  unsigned int compute_time = 0;
-  unsigned int epilogue_time = 0;
-  clock_t compute_start_time = 0;
-  clock_t epilogue_start_time = 0;
-  
-  if (DBG == 1){
-    compute_start_time = clock();
-  }
 
   cuda::barrier<cuda::thread_scope_block>::arrival_token tokenA, tokenB;
   for (int block_k = 0; block_k < K / BK_dim; block_k++)
@@ -255,22 +227,6 @@ kernel_1(
     wgmma_wait_group<0>();
   }
 
-  if (DBG == 1){
-    compute_time = clock() - compute_start_time;
-  }
-
-  // clock_t end_time = clock();
-  // compute_time = end_time - start_time;
-
-  // if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0){
-  //   printf("compute_time: %d ms\n", compute_time);
-  // }
-
-  // store a 64x256 matrix to C
-  if (DBG == 1){
-    epilogue_start_time = clock();
-  }
-
   bf16* C_block = C + (block_m * BM_dim + warpgroup_idx * WGMMA_M) * N + block_n * BN_dim;
 
   #define OUT_IDX(i, j) (i) * N + (j)
@@ -292,14 +248,6 @@ kernel_1(
     col += 16;
   }
 
-  if (DBG == 1){
-    epilogue_time = clock() - epilogue_start_time;
-  }
-
-  if (DBG == 1 && threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0){
-    printf("compute_time: %d cycles, epilogue_time: %d cycles\n", compute_time, epilogue_time);
-  }
-
   #undef OUT_IDX
 }
 
@@ -309,8 +257,7 @@ unsigned int prev_m = 0;
 unsigned int prev_n = 0;
 unsigned int prev_k = 0;
 
-// #include <chrono>
-void kernel1_launch(void* A_device, void* B_device, void* C_device, float alpha, float beta, unsigned int M, unsigned int N, unsigned int K)
+void launch(void* A_device, void* B_device, void* C_device, unsigned int M, unsigned int N, unsigned int K)
 {
 
     // get cpu time
@@ -320,7 +267,6 @@ void kernel1_launch(void* A_device, void* B_device, void* C_device, float alpha,
     constexpr unsigned int BN_dim = 256;
     constexpr unsigned int BK_dim = 64;
     constexpr unsigned int shmemNumBytes = BM_dim * BK_dim + BK_dim * BN_dim;
-    constexpr unsigned int DBG = 0;
 
     bf16* A_device_bf16 = reinterpret_cast<bf16*>(A_device);
     bf16* B_device_bf16 = reinterpret_cast<bf16*>(B_device);
@@ -343,8 +289,7 @@ void kernel1_launch(void* A_device, void* B_device, void* C_device, float alpha,
 
     }
 
-
-    CUDA_CHECK(cudaFuncSetAttribute(kernel_1<BM_dim, BN_dim, BK_dim>,
+    CUDA_CHECK(cudaFuncSetAttribute(matmul_kernel<BM_dim, BN_dim, BK_dim>,
     cudaFuncAttributeMaxDynamicSharedMemorySize,
     shmemNumBytes * 2 * sizeof(bf16)));
 
@@ -355,14 +300,12 @@ void kernel1_launch(void* A_device, void* B_device, void* C_device, float alpha,
 
     printf("m blocks: %d, n blocks: %d\n", m_blocks, n_blocks);
 
-    kernel_1
-    <BM_dim, BN_dim, BK_dim, DBG>
+    matmul_kernel
+    <BM_dim, BN_dim, BK_dim>
     <<<gridDimension, blockDimension>>>(
         A_tensor_map_device,
         B_tensor_map_device,
         C_device_bf16,
-        alpha,
-        beta,
         M,
         N,
         K
@@ -370,4 +313,4 @@ void kernel1_launch(void* A_device, void* B_device, void* C_device, float alpha,
     CUDA_CHECK(cudaPeekAtLastError());
 }
 
-
+} // namespace kernel1

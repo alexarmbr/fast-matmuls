@@ -10,34 +10,41 @@
 using bf16 = __nv_bfloat16;
 
 // Forward declaration of CUDA functions
-// void kernel1_launch(
-//     void* A_device,
-//     void* B_device,
-//     void* C_device,
-//     float alpha,
-//     float beta,
-//     unsigned int M,
-//     unsigned int N,
-//     unsigned int K);
-
-void kernel2_launch(
+namespace kernel1 {
+void launch(
     void* A_device,
     void* B_device,
     void* C_device,
-    float alpha,
-    float beta,
     unsigned int M,
     unsigned int N,
     unsigned int K);
+} // namespace kernel1
+
+namespace kernel2 {
+void launch(
+    void* A_device,
+    void* B_device,
+    void* C_device,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K);
+} // namespace kernel2
+
+namespace kernel3 {
+void launch(
+    void* A_device,
+    void* B_device,
+    void* C_device,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K);
+} // namespace kernel3
 
 // C++ wrapper function that will be called from Python
 torch::Tensor gemm_caller(
     torch::Tensor A,
     torch::Tensor B,
-    int64_t kernel_id,
-    double alpha = 1.0,
-    double beta = 0.0) {
-    
+    int64_t kernel_id) {
     
     auto M = A.size(0);
     auto K = A.size(1);
@@ -72,17 +79,17 @@ torch::Tensor gemm_caller(
     TORCH_CHECK(B.stride(0) == 1, "B must be contiguous in the first dimension");
     
     if (kernel_id == 1) {
-        // kernel1_launch(A.data_ptr(), B.data_ptr(), C.data_ptr(), static_cast<float>(alpha), static_cast<float>(beta), M, N, K);
-        // throw error
-        TORCH_CHECK(false, "Kernel 1 is not implemented");
+        kernel1::launch(A.data_ptr(), B.data_ptr(), C.data_ptr(), M, N, K);
     }
     else if (kernel_id == 2) {
-        kernel2_launch(A.data_ptr(), B.data_ptr(), C.data_ptr(), static_cast<float>(alpha), static_cast<float>(beta), M, N, K);
+        kernel2::launch(A.data_ptr(), B.data_ptr(), C.data_ptr(), M, N, K);
+    }
+    else if (kernel_id == 3) {
+        kernel3::launch(A.data_ptr(), B.data_ptr(), C.data_ptr(), M, N, K);
     }
     else {
         TORCH_CHECK(false, "Invalid kernel ID");
     }
-
     return C;
 }
 

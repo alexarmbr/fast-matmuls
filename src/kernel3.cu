@@ -5,7 +5,7 @@
 #include <cuda_bf16.h>
 #include <iostream>
 
-namespace kernel2 {
+namespace kernel3 {
 
 using bf16 = __nv_bfloat16;
 using barrier = cuda::barrier<cuda::thread_scope_block>;
@@ -37,17 +37,6 @@ __device__ __forceinline__ uint32_t cvta_to_shared_u32(const void *pointer) {
     return address;
   }
 
-// https://docs.nvidia.com/cuda/parallel-thread-execution/#asynchronous-warpgroup-level-matrix-shared-memory-layout-matrix-descriptor
-// template <unsigned int smem_width_bytes>
-// __device__ uint64_t make_smem_descriptor(bf16* smem_ptr)
-// {
-//   uint64_t smem_desc = 0;
-//   smem_desc |= matrix_descriptor_encode(cvta_to_shared_u32(smem_ptr));
-//   smem_desc |= matrix_descriptor_encode(smem_width_bytes * 8) << 32; // offset in bytes between groups of 8 rows
-//   smem_desc |= uint64_t(1) << 62; // 128B swizzle
-//   return smem_desc;
-// }
-
 __device__ void warpgroup_arrive() {
     asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
 }
@@ -61,20 +50,26 @@ __device__ void wgmma_wait_group() {
   asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
 }
 
+// https://docs.nvidia.com/cuda/parallel-thread-execution/#asynchronous-warpgroup-level-matrix-shared-memory-layout-matrix-descriptor
+template <unsigned int smem_width_bytes>
 __device__ uint64_t make_smem_desc(bf16* ptr) {
   constexpr uint64_t leading_dim_byte_offset = 16;
-  constexpr uint64_t stride_dim_byte_offset = 1024;
+  constexpr uint64_t stride_dim_byte_offset = smem_width_bytes;
   constexpr uint64_t swizzle_128b = 1ull;
   uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
   return matrix_descriptor_encode(addr) |
       (matrix_descriptor_encode(leading_dim_byte_offset) << 16) |
-      (matrix_descriptor_encode(stride_dim_byte_offset) << 32) |
+      (matrix_descriptor_encode(stride_dim_byte_offset * 8) << 32) |
       (swizzle_128b << 62);
 }
 
+template <unsigned int BK_dim>
 __device__ __forceinline__ void wgmma_m64n256k16_f32_bf16_bf16(float D[128], bf16* A_block_smem, bf16* B_block_smem){
-    uint64_t A_desc = make_smem_desc(A_block_smem);
-    uint64_t B_desc = make_smem_desc(B_block_smem);
+    uint64_t A_desc = make_smem_desc<BK_dim * sizeof(bf16)>(A_block_smem);
+    uint64_t B_desc = make_smem_desc<BK_dim * sizeof(bf16)>(B_block_smem);
+
+    // uint64_t A_desc = make_smem_desc(A_block_smem);
+    // uint64_t B_desc = make_smem_desc(B_block_smem);
     
     asm volatile (
         "wgmma.mma_async.sync.aligned.m64n256k16.f32.bf16.bf16 "
@@ -152,7 +147,27 @@ void createTensorMap(bf16* tensor_ptr, unsigned int gmem_height, unsigned int gm
   CUDA_CHECK(cudaMemcpy(tensor_map_device, &tensor_map_host, sizeof(CUtensorMap), cudaMemcpyHostToDevice));
 }
 
-#include <ctime>
+
+struct block_coordinates {
+  unsigned int block_m;
+  unsigned int block_n;
+};
+
+template <unsigned int BM_dim, unsigned int BN_dim, unsigned int TILE_M = 16, unsigned int TILE_N = 8>
+__device__ block_coordinates get_block_coordinates(unsigned int iteration, unsigned int M, unsigned int N){
+  unsigned int block_m = blockIdx.x % TILE_N;
+  unsigned int block_n = blockIdx.x / TILE_N;
+  
+  constexpr unsigned int n_elements_per_group = TILE_N * BN_dim;
+  unsigned int iterations_n = N / n_elements_per_group;
+  
+  unsigned int n = block_m + (iteration % iterations_n) * TILE_N;
+  unsigned int m = block_n + (iteration / iterations_n) * TILE_M;
+  assert(n < (N / BN_dim));
+  assert(m < (M / BM_dim));
+  
+  return {m, n};
+}
 
 
 template <unsigned int BM_dim,
@@ -173,8 +188,7 @@ matmul_kernel(
   constexpr unsigned int WGMMA_N = 256;
   constexpr unsigned int WGMMA_K = 16;
 
-  const unsigned int block_n = blockIdx.x;
-  const unsigned int block_m = blockIdx.y;
+  // launch a total of 128 blocks and divide them into 16x8 grid
   bool is_producer = threadIdx.x < 128;
 
   // __shared__ alignas(128) bf16 A_block_smem[BM_dim*BK_dim*QSIZE];
@@ -203,91 +217,97 @@ matmul_kernel(
 
   // sychronize so that the initialized barrier is visible to all threads
   __syncthreads();
+  
+  const unsigned int total_iterations = ((M / BM_dim) * (N / BN_dim)) / gridDim.x;
+    if (is_producer){
+      asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(24));
+      int buffer_stage = 0;
 
-  if (is_producer){
-    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(24));
+      for (unsigned int persistent_kernel_iter = 0; persistent_kernel_iter < total_iterations; persistent_kernel_iter++){
+        block_coordinates block_coords = get_block_coordinates<BM_dim, BN_dim>(persistent_kernel_iter, M, N);
 
-    if (threadIdx.x == 0){
-      int q_idx = 0;
-      for (int block_k = 0; block_k < K / BK_dim; block_k++){
-        // producer arrives and waits at the empty barrier for current pipeline stage
-        // once the consumer arrives at the same empty barrier (signifying that it has consumed this pipeline stage)
-        // producer can initiate the TMA copy that will write to this pipeline stage
-        empty_barrier[q_idx].wait(empty_barrier[q_idx].arrive());
+          if (threadIdx.x == 0){
+            for (int block_k = 0; block_k < K / BK_dim; block_k++){
+              // producer arrives and waits at the empty barrier for current pipeline stage
+              // once the consumer arrives at the same empty barrier (signifying that it has consumed this pipeline stage)
+              // producer can initiate the TMA copy that will write to this pipeline stage
+              empty_barrier[buffer_stage].wait(empty_barrier[buffer_stage].arrive());
 
-        // copy A and B from gmem to smem
-        cuda::device::experimental::cp_async_bulk_tensor_2d_global_to_shared(&A_block_smem[q_idx * (BM_dim * BK_dim)], tensorMapA, block_k * BK_dim, block_m * BM_dim, full_barrier[q_idx]);
-        cuda::device::experimental::cp_async_bulk_tensor_2d_global_to_shared(&B_block_smem[q_idx * (BN_dim * BK_dim)], tensorMapB, block_k * BK_dim, block_n * BN_dim, full_barrier[q_idx]);
+              // copy A and B from gmem to smem
+              cuda::device::experimental::cp_async_bulk_tensor_2d_global_to_shared(&A_block_smem[buffer_stage * (BM_dim * BK_dim)], tensorMapA, block_k * BK_dim, block_coords.block_m * BM_dim, full_barrier[buffer_stage]);
+              cuda::device::experimental::cp_async_bulk_tensor_2d_global_to_shared(&B_block_smem[buffer_stage * (BN_dim * BK_dim)], tensorMapB, block_k * BK_dim, block_coords.block_n * BN_dim, full_barrier[buffer_stage]);
+              
+              // producer arrives at the full barrier for current pipeline stage and sets the transaction count to BM * BK + BN * BK bytes
+              // anyone waiting at this full_barrier will only proceed once this many bytes have been transferred from gmem to smem
+              barrier::arrival_token _ = cuda::device::barrier_arrive_tx(full_barrier[buffer_stage], 1, pipelineStageNumBytes);
+              buffer_stage = (buffer_stage + 1) % QSIZE;
+            }
+          }
+        }
+    }
+
+    // consumer
+    else {
+      asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(240));
+      int buffer_stage = 0;
+      float D_reg[128];
+      memset(D_reg, 0, sizeof(D_reg));
+      const unsigned int consumer_idx = (threadIdx.x / 128) - 1;
+
+      // initialize the empty barrier for all pipeline stages with consumer arriving
+      for (int i = 0; i < QSIZE; i++){
+        barrier::arrival_token _ = empty_barrier[i].arrive();
+      }
+      
+      for (unsigned int persistent_kernel_iter = 0; persistent_kernel_iter < total_iterations; persistent_kernel_iter++){
+      block_coordinates block_coords = get_block_coordinates<BM_dim, BN_dim>(persistent_kernel_iter, M, N);
+
+      for (int block_k = 0; block_k < K / BK_dim; block_k++)
+      {
+        full_barrier[buffer_stage].wait(full_barrier[buffer_stage].arrive());
+
+        warpgroup_arrive();
         
-        // producer arrives at the full barrier for current pipeline stage and sets the transaction count to BM * BK + BN * BK bytes
-        // anyone waiting at this full_barrier will only proceed once this many bytes have been transferred from gmem to smem
-        barrier::arrival_token _ = cuda::device::barrier_arrive_tx(full_barrier[q_idx], 1, pipelineStageNumBytes);
-        q_idx = (q_idx + 1) % QSIZE;
+        bf16* A_stage_smem = A_block_smem + buffer_stage * (BM_dim * BK_dim);
+        bf16* B_stage_smem = B_block_smem + buffer_stage * (BN_dim * BK_dim);
+        bf16* A_warpgroup_smem = A_stage_smem + consumer_idx * WGMMA_M * BK_dim;
+        
+        #pragma unroll
+        for (int i = 0; i < BK_dim / WGMMA_K; i++){
+          int offset = i * WGMMA_K;
+          wgmma_m64n256k16_f32_bf16_bf16<BK_dim>(D_reg, A_warpgroup_smem + offset, B_stage_smem + offset);
+        }
+
+        wgmma_commit_group();
+        wgmma_wait_group<0>();
+
+        barrier::arrival_token _ = empty_barrier[buffer_stage].arrive();
+        buffer_stage = (buffer_stage + 1) % QSIZE;
       }
+    
+      bf16* C_block = C + (block_coords.block_m * BM_dim + consumer_idx * WGMMA_M) * N + block_coords.block_n * BN_dim;
+
+      #define OUT_IDX(i, j) (i) * N + (j)
+      int thread = threadIdx.x % 128;
+      int warp = thread / 32;
+      int lane = thread % 32;
+      int row = (warp * 16) + (lane / 4);
+      int col = (thread % 4) * 2;
+      for (int column_group = 0; column_group < WGMMA_N / 16; column_group++)
+      {
+        C_block[OUT_IDX(row, col)] = __float2bfloat16(D_reg[column_group * 8]);
+        C_block[OUT_IDX(row, col + 1)] = __float2bfloat16(D_reg[column_group * 8 + 1]);
+        C_block[OUT_IDX(row + 8, col)] = __float2bfloat16(D_reg[column_group * 8 + 2]);
+        C_block[OUT_IDX(row + 8, col + 1)] = __float2bfloat16(D_reg[column_group * 8 + 3]);
+        C_block[OUT_IDX(row, col + 8)] = __float2bfloat16(D_reg[column_group * 8 + 4]);
+        C_block[OUT_IDX(row, col + 9)] = __float2bfloat16(D_reg[column_group * 8 + 5]);
+        C_block[OUT_IDX(row + 8, col + 8)] = __float2bfloat16(D_reg[column_group * 8 + 6]);
+        C_block[OUT_IDX(row + 8, col + 9)] = __float2bfloat16(D_reg[column_group * 8 + 7]);
+        col += 16;
+      }
+      #undef OUT_IDX
     }
   }
-
-  // consumer
-  else {
-    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(240));
-
-    float D_reg[128];
-    memset(D_reg, 0, sizeof(D_reg));
-    const unsigned int consumer_idx = (threadIdx.x / 128) - 1;
-
-    // initialize the empty barrier for all pipeline stages
-    for (int i = 0; i < QSIZE; i++){
-      barrier::arrival_token _ = empty_barrier[i].arrive();
-    }
-
-    int q_idx = 0;
-    for (int block_k = 0; block_k < K / BK_dim; block_k++)
-    {
-      full_barrier[q_idx].wait(full_barrier[q_idx].arrive());
-
-      warpgroup_arrive();
-      
-      bf16* A_stage_smem = A_block_smem + q_idx * (BM_dim * BK_dim);
-      bf16* B_stage_smem = B_block_smem + q_idx * (BN_dim * BK_dim);
-      bf16* A_warpgroup_smem = A_stage_smem + consumer_idx * WGMMA_M * BK_dim;
-      
-      #pragma unroll
-      for (int i = 0; i < BK_dim / WGMMA_K; i++){
-        int offset = i * WGMMA_K;
-        wgmma_m64n256k16_f32_bf16_bf16(D_reg, A_warpgroup_smem + offset, B_stage_smem + offset);
-      }
-
-      wgmma_commit_group();
-      wgmma_wait_group<0>();
-
-      barrier::arrival_token _ = empty_barrier[q_idx].arrive();
-      q_idx = (q_idx + 1) % QSIZE;
-    }
-  
-    bf16* C_block = C + (block_m * BM_dim + consumer_idx * WGMMA_M) * N + block_n * BN_dim;
-
-    #define OUT_IDX(i, j) (i) * N + (j)
-    int thread = threadIdx.x % 128;
-    int warp = thread / 32;
-    int lane = thread % 32;
-    int row = (warp * 16) + (lane / 4);
-    int col = (thread % 4) * 2;
-    for (int column_group = 0; column_group < WGMMA_N / 16; column_group++)
-    {
-      C_block[OUT_IDX(row, col)] = __float2bfloat16(D_reg[column_group * 8]);
-      C_block[OUT_IDX(row, col + 1)] = __float2bfloat16(D_reg[column_group * 8 + 1]);
-      C_block[OUT_IDX(row + 8, col)] = __float2bfloat16(D_reg[column_group * 8 + 2]);
-      C_block[OUT_IDX(row + 8, col + 1)] = __float2bfloat16(D_reg[column_group * 8 + 3]);
-      C_block[OUT_IDX(row, col + 8)] = __float2bfloat16(D_reg[column_group * 8 + 4]);
-      C_block[OUT_IDX(row, col + 9)] = __float2bfloat16(D_reg[column_group * 8 + 5]);
-      C_block[OUT_IDX(row + 8, col + 8)] = __float2bfloat16(D_reg[column_group * 8 + 6]);
-      C_block[OUT_IDX(row + 8, col + 9)] = __float2bfloat16(D_reg[column_group * 8 + 7]);
-      col += 16;
-    }
-    #undef OUT_IDX
-  
-  }
-
 }
 
 CUtensorMap* A_tensor_map_device = nullptr;
@@ -296,12 +316,13 @@ unsigned int prev_m = 0;
 unsigned int prev_n = 0;
 unsigned int prev_k = 0;
 
-// #include <chrono>
 void launch(void* A_device, void* B_device, void* C_device, unsigned int M, unsigned int N, unsigned int K)
 {
+    // block scheduling logic only supports M, N, K >= 2048
+    assert(M >= 2048);
+    assert(N >= 2048);
+    assert(K >= 2048);
 
-    // get cpu time
-    // auto start = std::chrono::high_resolution_clock::now();
     constexpr unsigned int num_consumer_warpgroups = 2;
     constexpr unsigned int BM_dim = 64 * num_consumer_warpgroups;
     constexpr unsigned int BN_dim = 256;
@@ -336,9 +357,7 @@ void launch(void* A_device, void* B_device, void* C_device, unsigned int M, unsi
     cudaFuncAttributeMaxDynamicSharedMemorySize,
     shmemNumBytes));
 
-    unsigned int n_blocks = (N + BN_dim - 1) / BN_dim;
-    unsigned int m_blocks = (M + BM_dim - 1) / BM_dim;
-    dim3 gridDimension(n_blocks, m_blocks);
+    dim3 gridDimension(128);
     dim3 blockDimension(128 * (num_consumer_warpgroups + 1));
 
     matmul_kernel
@@ -356,4 +375,4 @@ void launch(void* A_device, void* B_device, void* C_device, unsigned int M, unsi
 }
 
 
-} // namespace kernel2
+} // namespace kernel3
