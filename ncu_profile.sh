@@ -11,7 +11,9 @@ M, N, K = 8192, 8192, 8192
 A = torch.randn(M, K, dtype=torch.bfloat16, device='cuda')
 B = torch.randn(K, N, dtype=torch.bfloat16, device='cuda')
 B = B.t().contiguous().t()
-C = torch.ops.gemm_ext.gemm_caller(A, B, 1, 1.0, 0.0)
+C = torch.ops.gemm_ext.gemm_caller(A, B, 1)
+C = torch.ops.gemm_ext.gemm_caller(A, B, 2)
+C = torch.ops.gemm_ext.gemm_caller(A, B, 3)
 "
 
 ncu -f -o profiling/kernel --set full python -c "$program"

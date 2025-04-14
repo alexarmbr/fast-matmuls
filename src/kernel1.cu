@@ -253,9 +253,9 @@ matmul_kernel(
 
 CUtensorMap* A_tensor_map_device = nullptr;
 CUtensorMap* B_tensor_map_device = nullptr;
-unsigned int prev_m = 0;
-unsigned int prev_n = 0;
-unsigned int prev_k = 0;
+bf16* A_device_bf16_ = nullptr;
+bf16* B_device_bf16_ = nullptr;
+bf16* C_device_bf16_ = nullptr;
 
 void launch(void* A_device, void* B_device, void* C_device, unsigned int M, unsigned int N, unsigned int K)
 {
@@ -272,7 +272,7 @@ void launch(void* A_device, void* B_device, void* C_device, unsigned int M, unsi
     bf16* B_device_bf16 = reinterpret_cast<bf16*>(B_device);
     bf16* C_device_bf16 = reinterpret_cast<bf16*>(C_device);
 
-    if (A_tensor_map_device == nullptr || B_tensor_map_device == nullptr || prev_m != M || prev_n != N || prev_k != K){
+    if (A_tensor_map_device == nullptr || B_tensor_map_device == nullptr || A_device_bf16_ != A_device_bf16 || B_device_bf16_ != B_device_bf16 || C_device_bf16_ != C_device_bf16){
       
       if (A_tensor_map_device == nullptr){
         CUDA_CHECK(cudaMalloc(&A_tensor_map_device, sizeof(CUtensorMap)));
@@ -281,12 +281,12 @@ void launch(void* A_device, void* B_device, void* C_device, unsigned int M, unsi
       if (B_tensor_map_device == nullptr){
         CUDA_CHECK(cudaMalloc(&B_tensor_map_device, sizeof(CUtensorMap)));
       }
-      prev_m = M;
-      prev_n = N;
-      prev_k = K;
+      
+      A_device_bf16_ = A_device_bf16;
+      B_device_bf16_ = B_device_bf16;
+      C_device_bf16_ = C_device_bf16;
       createTensorMap<BM_dim, BK_dim>(A_device_bf16, M, K, A_tensor_map_device);
       createTensorMap<BN_dim, BK_dim>(B_device_bf16, N, K, B_tensor_map_device);
-
     }
 
     CUDA_CHECK(cudaFuncSetAttribute(matmul_kernel<BM_dim, BN_dim, BK_dim>,
@@ -298,8 +298,6 @@ void launch(void* A_device, void* B_device, void* C_device, unsigned int M, unsi
     dim3 gridDimension(n_blocks, m_blocks);
     dim3 blockDimension(128 * num_consumer_warpgroups);
 
-    printf("m blocks: %d, n blocks: %d\n", m_blocks, n_blocks);
-
     matmul_kernel
     <BM_dim, BN_dim, BK_dim>
     <<<gridDimension, blockDimension>>>(
@@ -310,6 +308,7 @@ void launch(void* A_device, void* B_device, void* C_device, unsigned int M, unsi
         N,
         K
     );
+    CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaPeekAtLastError());
 }
 
